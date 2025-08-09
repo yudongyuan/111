@@ -710,7 +710,7 @@ for epoch in range(EPOCH_COUNT):
             f"SBS2 P={P1:.1f}dBm (U={rU_b[1]},E={rE_b[1]},M={rM_b[1]}), "
             f"SBS3 P={P2:.1f}dBm (U={rU_b[2]},E={rE_b[2]},M={rM_b[2]}), "
             f"MBS1 P={P3:.1f}dBm (U={rU_b[3]},E={rE_b[3]},M={rM_b[3]}), "
-            f"epoch_util={best_epoch_util:.4f}, "
+            f"epoch_util={best_epoch_util:.4f}, " +
             (f"energy={best_epoch_solution.get('total_energy_watt', 0.0):.3f} W" if best_epoch_solution.get('total_energy_watt') is not None else "")
         )
         for b, P in enumerate([P0, P1, P2, P3]):
