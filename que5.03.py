@@ -321,6 +321,9 @@ for epoch in range(EPOCH_COUNT):
 
     T_samp = len(times_in_epoch)
 
+    # 预缓存每个用户在本 epoch 内的活跃样本掩码，避免在功率/负载迭代中重复构造
+    active_mask_by_u = {u: (np.array(arrivals_time[u]) > 0) for u in users}
+
     # compute arrival totals and observed task counts in this epoch
     arrival_epoch_bits = {u: sum(arrivals_time[u]) for u in users}
     observed_tasks = {u: (arrival_epoch_bits[u] / D_u[u]) if D_u[u] > 0 else 0.0 for u in users}
@@ -370,119 +373,124 @@ for epoch in range(EPOCH_COUNT):
         users_by_bs[serving_bs[u]].append(u)
 
     def build_U_table_with_power_and_load(powers_dbm_vec, load_vec):
-        """根据功率和负载（RB 占用比例）计算 U_table。
+        """根据功率和负载（RB 占用比例）计算 U_table（向量化加速版）。
         powers_dbm_vec: [P_SBS1, P_SBS2, P_SBS3, P_MBS]
         load_vec: [l_SBS1, l_SBS2, l_SBS3, l_MBS] in [0,1]
         """
         P_mW = [dbm_to_mw(p) for p in powers_dbm_vec]
         U_table_local = {u: [] for u in users}
+
+        # 便捷常量与函数（向量化版排队延迟估计）
+        def mm1_Wq_vec(lam, E_S_vec):
+            rho = lam * E_S_vec
+            # 避免除零/负值
+            denom = np.maximum(1.0 - rho, 1e-30)
+            Wq = (lam * (E_S_vec ** 2)) / denom
+            Wq = np.where(rho >= 1.0 - 1e-12, np.inf, Wq)
+            return Wq
+
+        def kingman_Wq_vec(lam, E_S_vec, Ca2_val=1.0, Cs2_val=0.0):
+            rho = lam * E_S_vec
+            denom = np.maximum(1.0 - rho, 1e-30)
+            Wq = (rho / denom) * ((Ca2_val + Cs2_val) / 2.0) * E_S_vec
+            Wq = np.where(rho >= 1.0 - 1e-12, np.inf, Wq)
+            return Wq
+
         for u in users:
             utype = str(u)[0].upper()
-            # 按类设置每用户试探 RB 上限
+            # 每用户试探 RB 上限
             if utype == 'U':
                 max_r_try = min(RMAX_U, MAX_R_FOR_NOISE)
             elif utype == 'E':
                 max_r_try = min(RMAX_E, MAX_R_FOR_NOISE)
             else:
                 max_r_try = min(RMAX_M, MAX_R_FOR_NOISE)
+
             if arrival_epoch_bits.get(u, 0.0) <= 0.0:
                 U_table_local[u] = [0.0] * (max_r_try + 1)
                 continue
+
             b_serv = serving_bs[u]
-            # 预取增益序列
-            g_serv = gains_arr[b_serv][u]
-            # 干扰仅来自其它 SBS（0,1,2）
-            g_int = []
-            for b in (0, 1, 2):
-                if b == b_serv:
-                    continue
-                g_int.append(gains_arr[b][u])
+            g_serv = gains_arr[b_serv][u]  # shape (T_samp,)
 
-            # 预计算向量化的接收/干扰功率序列
-            P_sig_vec = P_mW[b_serv] * g_serv  # shape (T_samp,)
-            P_int_vec = np.zeros_like(P_sig_vec)
-            if b_serv in (0,1,2):
-                int_idx = 0
-                for b in (0, 1, 2):
-                    if b == b_serv:
+            # 构造干扰功率（仅 SBS 间互扰）
+            P_sig_vec = P_mW[b_serv] * g_serv  # (T_samp,)
+            if b_serv in (0, 1, 2):
+                P_int_vec = np.zeros_like(P_sig_vec)
+                for b_int in (0, 1, 2):
+                    if b_int == b_serv:
                         continue
-                    P_int_vec += P_mW[b] * g_int[int_idx] * float(load_vec[b])
-                    int_idx += 1
+                    P_int_vec += P_mW[b_int] * gains_arr[b_int][u] * float(load_vec[b_int])
             else:
-                # MBS 频谱不重叠，无跨站干扰
-                pass
+                P_int_vec = np.zeros_like(P_sig_vec)
 
-            for r in range(0, max_r_try + 1):
-                if r == 0:
-                    # 无 RB 分配
-                    U_table_local[u].append(0.0)
-                    continue
-                N_vec = NOISE_MW_BY_R[r]
-                denom_vec = N_vec + P_int_vec
-                # 避免除零
-                denom_vec = np.where(denom_vec > 0.0, denom_vec, 1e-30)
-                snr_eff_vec = P_sig_vec / denom_vec
-                R_t = r * B * np.log2(np.maximum(1.0 + snr_eff_vec, 1e-12))
-                # 服务时间序列
-                S_t = np.where(R_t > 1e-12, (D_u[u] / R_t), np.inf)
+            # r 向量 [0..max_r_try]
+            r_vals = np.arange(max_r_try + 1, dtype=float)
+            # 取出噪声序列，形状 (R,)
+            N_mW_r = NOISE_MW_BY_R[:max_r_try + 1].astype(float)
 
-                finite_S = S_t[np.isfinite(S_t)]
-                E_S = float(np.mean(finite_S)) if finite_S.size > 0 else float('inf')
-                lam = lambda_epoch[u]
-                if u in users_by_type['U']:
-                    Wq, _ = mm1_Wq(lam, E_S)
-                else:
-                    Wq, _ = kingman_Wq(lam, E_S, Ca2[u], 0.0)
+            # 形状对齐：(R, T)
+            denom = N_mW_r[:, None] + P_int_vec[None, :]
+            denom = np.where(denom > 0.0, denom, 1e-30)
+            snr_eff = P_sig_vec[None, :] / denom
+            # 计算各 r 的速率与服务时间矩阵 (R, T)
+            log_term = np.log2(np.maximum(1.0 + snr_eff, 1e-12))
+            R_t = (r_vals[:, None] * B) * log_term
+            S_t = np.where(R_t > 1e-12, (D_u[u] / R_t), np.inf)
+
+            # E[S]（按题实现使用所有时间样本的有限均值）
+            finite_mask = np.isfinite(S_t)
+            finite_counts = np.sum(finite_mask, axis=1)
+            finite_sums = np.sum(np.where(finite_mask, S_t, 0.0), axis=1)
+            E_S_vec = np.where(finite_counts > 0, finite_sums / np.maximum(finite_counts, 1), np.inf)
+
+            lam = lambda_epoch[u]
+            if u in users_by_type['U']:
+                Wq_vec = mm1_Wq_vec(lam, E_S_vec)
+            else:
+                Wq_vec = kingman_Wq_vec(lam, E_S_vec, Ca2[u], 0.0)
+
+            # 仅对活跃样本计算 L 与效用
+            active_mask = active_mask_by_u[u]
+            num_active = int(np.sum(active_mask))
+
+            util_vec = np.zeros(max_r_try + 1, dtype=float)
+            if num_active > 0:
+                S_active = S_t[:, active_mask]  # (R, Ta)
+                R_active = R_t[:, active_mask]  # (R, Ta)
+                L_mat = Wq_vec[:, None] + S_active  # (R, Ta)
 
                 if utype == 'M':
-                    active_count = 0
-                    success_count = 0
-                    sum_L_success = 0.0
-                    has_task_mask = (np.array(arrivals_time[u]) > 0)
-                    if np.any(has_task_mask):
-                        S_active = S_t[has_task_mask]
-                        R_active = R_t[has_task_mask]
-                        active_count = int(np.sum(has_task_mask))
-                        L_vec = np.where(
-                            np.isfinite(Wq) & np.isfinite(S_active),
-                            (Wq + S_active),
-                            np.inf,
-                        )
-                        success_mask = (np.isfinite(L_vec) & (L_vec <= t_max_M) & (R_active > 0.0))
-                        success_count = int(np.sum(success_mask))
-                        sum_L_success = float(np.sum(L_vec[success_mask])) if success_count > 0 else 0.0
-                    if active_count > 0:
-                        if success_count > 0:
-                            D_avg_success = sum_L_success / float(success_count)
-                        else:
-                            D_avg_success = float('inf')
-                        if D_avg_success <= t_max_M:
-                            U_avg = float(success_count) / float(active_count)
-                        else:
-                            U_avg = -beta_M
-                    else:
-                        U_avg = 0.0
+                    success_mask = (np.isfinite(L_mat)) & (L_mat <= t_max_M) & (R_active > 0.0)
+                    success_counts = np.sum(success_mask, axis=1).astype(float)
+                    sum_L_success = np.sum(np.where(success_mask, L_mat, 0.0), axis=1)
+                    D_avg_success = np.where(success_counts > 0, sum_L_success / np.maximum(success_counts, 1.0), np.inf)
+                    util_vec = np.where(D_avg_success <= t_max_M,
+                                        success_counts / float(num_active),
+                                        -beta_M)
                 else:
-                    s_sum = 0.0
-                    num_active = 0
-                    has_task_mask = (np.array(arrivals_time[u]) > 0)
-                    if np.any(has_task_mask):
-                        R_active = R_t[has_task_mask]
-                        S_active = S_t[has_task_mask]
-                        L_vec = np.where(
-                            np.isfinite(Wq) & np.isfinite(S_active),
-                            (Wq + S_active),
-                            np.inf,
-                        )
-                        num_active = int(np.sum(has_task_mask))
-                        # 逐元素计算基础效用与惩罚
-                        Qb_vec = np.array([Q_base_function(utype, R_active[i], L_vec[i]) for i in range(len(R_active))], dtype=float)
-                        Pen_vec = np.where(np.isfinite(L_vec), (kappa + alpha_pen * L_vec), (kappa + alpha_pen * 1e6))
-                        s_sum = float(np.sum(Qb_vec - Pen_vec))
-                    U_avg = float(s_sum / num_active) if num_active > 0 else 0.0
+                    # 基础效用（按类）
+                    if utype == 'U':
+                        # Q = alpha^L if L<=t_max_U else -beta_U
+                        Qb = np.where(L_mat <= t_max_U, np.power(alpha_U, L_mat), -beta_U)
+                    else:  # 'E'
+                        # 若 L<=t_max_E: Q=1 或 R/Rmin；否则 -beta_E
+                        cond_time = (L_mat <= t_max_E)
+                        rate_ok = (R_active >= R_min_E)
+                        Qb = np.where(cond_time, np.where(rate_ok, 1.0, R_active / R_min_E), -beta_E)
 
-                # 应用类公平性权重
-                U_table_local[u].append(CLASS_WEIGHT.get(utype, 1.0) * U_avg)
+                    Pen = (kappa + alpha_pen * L_mat)
+                    s_sum = np.sum(Qb - Pen, axis=1)
+                    util_vec = s_sum / float(num_active)
+
+            # 数值清洗，避免 inf/nan 进入后续堆合并与枚举
+            util_vec = np.where(np.isfinite(util_vec), util_vec, VERY_NEG)
+            # 类公平性权重
+            util_vec = CLASS_WEIGHT.get(utype, 1.0) * util_vec
+            # r=0 定义为 0（与原实现一致）
+            util_vec[0] = 0.0
+            U_table_local[u] = util_vec.tolist()
+
         return U_table_local
 
     def precompute_class_utility_curve(U_table_local, users_in_bs, class_cap_r, bs_cap):
