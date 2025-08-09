@@ -34,6 +34,10 @@ BS_CAP = {0: 50, 1: 50, 2: 50, 3: 100}
 P_FIXED_WATT = 28.0          # 固定能耗（W）
 K_RB_WATT_PER_RB = 0.75      # RB 激活能耗系数（W/RB）
 ETA_PA = 0.35                # 功放效率（损耗系数）
+# 新增：空闲小区休眠功耗（当该基站未分配任何RB时采用）
+P_SLEEP_WATT = 6.0
+# 新增：效用-能耗折中采用 epsilon-constraint（允许相对效用轻微下降，优先选能耗最低方案）
+UTIL_RELAX = 0.01  # 允许相对下降 1% 的效用，用于优先选择低能耗方案
 
 # 惩罚参数（你可以调整）
 kappa = 0.1
@@ -569,11 +573,12 @@ for epoch in range(EPOCH_COUNT):
         return alloc, class_util
 
     # 功率控制 + 负载耦合迭代
-    # 功率网格：SBS ∈ [15,20,25,30]；MBS ∈ [20,30,35,40]
-    grid_sbs = [15.0, 20.0, 25.0, 30.0]
-    grid_mbs = [20.0, 30.0, 35.0, 40.0]
+    # 功率网格（扩展低功率点以更易寻找到低能耗解）：SBS ∈ [5,10,15,20,25,30]；MBS ∈ [10,20,30,35,40]
+    grid_sbs = [5.0, 10.0, 15.0, 20.0, 25.0, 30.0]
+    grid_mbs = [10.0, 20.0, 30.0, 35.0, 40.0]
     best_epoch_util = -1e18
     best_epoch_solution = None
+    candidates = []
 
     for P0, P1, P2, P3 in itertools.product(grid_sbs, grid_sbs, grid_sbs, grid_mbs):
         loads = [0.3, 0.3, 0.3, 0.3]  # 初始负载猜测（更保守，降低干扰）
@@ -652,41 +657,34 @@ for epoch in range(EPOCH_COUNT):
             total = 0.0
             for b in (0,1,2,3):
                 n_rb = int(rU[b] + rE[b] + rM[b])
+                if n_rb <= 0:
+                    # 无负载时进入休眠，采用更低的待机功耗
+                    total += P_SLEEP_WATT
+                    continue
                 p_output_w = dbm_to_watt(p_vec_dbm[b])
                 p_tx = p_output_w / ETA_PA
                 total += (P_FIXED_WATT + K_RB_WATT_PER_RB * n_rb + p_tx)
             return float(total)
         combo_energy_w = compute_total_energy_watt([P0,P1,P2,P3], rU_b, rE_b, rM_b)
 
-        # 双目标选择：先最大化效用，再在最大效用集合内最小化能耗
-        UTIL_EPS = 1e-6
-        if (best_epoch_solution is None) or (total_util_epoch > best_epoch_util + UTIL_EPS):
+        # 保存候选解，用于后续 epsilon-constraint 选择
+        candidates.append({
+            'powers_dbm': [P0, P1, P2, P3],
+            'rU': rU_b,
+            'rE': rE_b,
+            'rM': rM_b,
+            'util_b': util_b,
+            'loads': loads,
+            'serving_bs': serving_bs,
+            'total_energy_watt': combo_energy_w,
+            'total_util_epoch': total_util_epoch,
+        })
+        if total_util_epoch > best_epoch_util:
             best_epoch_util = total_util_epoch
-            best_epoch_solution = {
-                'powers_dbm': [P0, P1, P2, P3],
-                'rU': rU_b,
-                'rE': rE_b,
-                'rM': rM_b,
-                'util_b': util_b,
-                'loads': loads,
-                'serving_bs': serving_bs,
-                'total_energy_watt': combo_energy_w,
-            }
-        elif abs(total_util_epoch - best_epoch_util) <= UTIL_EPS:
-            if combo_energy_w < best_epoch_solution.get('total_energy_watt', float('inf')):
-                best_epoch_solution = {
-                    'powers_dbm': [P0, P1, P2, P3],
-                    'rU': rU_b,
-                    'rE': rE_b,
-                    'rM': rM_b,
-                    'util_b': util_b,
-                    'loads': loads,
-                    'serving_bs': serving_bs,
-                    'total_energy_watt': combo_energy_w,
-                }
 
-    # 输出本 epoch 结果（逐基站）
-    if best_epoch_solution is None:
+    # 先根据 epsilon-constraint 从所有候选中选出方案：
+    # 允许 UTIL_RELAX 相对下降的效用阈值内，选择能耗最低的方案；若无，则选择效用最高的能耗最低者
+    if not candidates:
         print(f"Epoch {epoch + 1}: 未找到可行解")
         for b in (0, 1, 2, 3):
             results.append({
@@ -699,6 +697,17 @@ for epoch in range(EPOCH_COUNT):
                 'total_util_epoch': 0.0
             })
     else:
+        util_threshold = (1.0 - UTIL_RELAX) * best_epoch_util
+        feasible = [c for c in candidates if c['total_util_epoch'] >= util_threshold]
+        if feasible:
+            # 在满足效用阈值的解中选能耗最低
+            best_epoch_solution = min(feasible, key=lambda c: c['total_energy_watt'])
+        else:
+            # 回退：在效用最高的集合中选能耗最低
+            best_util = max(c['total_util_epoch'] for c in candidates)
+            best_set = [c for c in candidates if abs(c['total_util_epoch'] - best_util) <= 1e-6]
+            best_epoch_solution = min(best_set, key=lambda c: c['total_energy_watt'])
+
         P0, P1, P2, P3 = best_epoch_solution['powers_dbm']
         rU_b = best_epoch_solution['rU']
         rE_b = best_epoch_solution['rE']
@@ -710,7 +719,7 @@ for epoch in range(EPOCH_COUNT):
             f"SBS2 P={P1:.1f}dBm (U={rU_b[1]},E={rE_b[1]},M={rM_b[1]}), "
             f"SBS3 P={P2:.1f}dBm (U={rU_b[2]},E={rE_b[2]},M={rM_b[2]}), "
             f"MBS1 P={P3:.1f}dBm (U={rU_b[3]},E={rE_b[3]},M={rM_b[3]}), "
-            f"epoch_util={best_epoch_util:.4f}, "
+            f"epoch_util={best_epoch_solution['total_util_epoch']:.4f}, " +
             (f"energy={best_epoch_solution.get('total_energy_watt', 0.0):.3f} W" if best_epoch_solution.get('total_energy_watt') is not None else "")
         )
         for b, P in enumerate([P0, P1, P2, P3]):
@@ -721,7 +730,7 @@ for epoch in range(EPOCH_COUNT):
                 'rU': int(rU_b[b]),
                 'rE': int(rE_b[b]),
                 'rM': int(rM_b[b]),
-                'total_util_epoch': float(best_epoch_util),
+                'total_util_epoch': float(best_epoch_solution['total_util_epoch']),
                 'total_energy_epoch_W': float(best_epoch_solution.get('total_energy_watt', 0.0))
             })
 
